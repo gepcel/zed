@@ -4,7 +4,7 @@ use gpui::{AnyElement, Entity};
 use picker::Picker;
 use repl::{
     ExecutionState, JupyterSettings, Kernel, KernelSpecification, KernelStatus, Session,
-    SessionSupport,
+    SessionSupport, ReplRunMode,
     components::{KernelPickerDelegate, KernelSelector},
     worktree_id_for_editor,
 };
@@ -144,7 +144,7 @@ impl QuickActionBar {
                         {
                             let editor = editor.clone();
                             move |window, cx| {
-                                repl::run(editor.clone(), true, window, cx).log_err();
+                                repl::run(editor.clone(), true, window, cx, ReplRunMode::Block).log_err();
                             }
                         },
                     )
