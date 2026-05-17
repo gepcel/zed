@@ -638,6 +638,82 @@ fn jupytext_cells(
     (snippets, None)
 }
 
+
+/// 找到当前行的【最小完整语法单元】
+/// 规则：
+/// 1. 跨行表达式（如跨多行的函数调用）→ 返回整个跨行范围
+/// 2. 块语句（if/for/def/while）→ 返回整个块
+/// 3. 普通行 → 返回单行
+fn line_runnable_range(buffer: &BufferSnapshot, range: Range<Point>) -> Range<Point> {
+    let offset = range.start.to_offset(buffer);
+    let layer = match buffer.syntax_layer_at(offset) {
+        Some(layer) => layer,
+        None => return range,
+    };
+    let root = layer.node();
+    let mut cursor = root.walk();
+
+    // 下沉到光标所在的最深节点
+    while cursor.goto_first_child_for_byte(offset).is_some() {}
+    let mut current = cursor.node();
+
+    const EXPRESSION_NODES: &[&str] = &[
+        "argument_list",
+        "call",
+        "parameters",
+        "expression_list",
+        "assignment",
+    ];
+
+    const BLOCK_NODES: &[&str] = &[
+        "function_definition",
+        "for_statement",
+        "if_statement",
+        "else_clause",
+        "while_statement",
+        "class_definition",
+    ];
+
+    loop {
+        let kind = current.kind();
+
+        // 优先级1：跨行表达式 → 立即返回
+        if EXPRESSION_NODES.contains(&kind)
+            && current.start_position().row != current.end_position().row
+        {
+            let start = buffer.offset_to_point(current.start_byte());
+            let end = buffer.offset_to_point(current.end_byte());
+            return start..end;
+        }
+
+        // 优先级2：最内层块语句 → 立即返回
+        if BLOCK_NODES.contains(&kind) {
+            let start = buffer.offset_to_point(current.start_byte());
+            let end = buffer.offset_to_point(current.end_byte());
+            return start..end;
+        }
+
+        // 向上一层，遇根节点则停止
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if matches!(
+            parent.kind(),
+            "module" | "program" | "source_file" | "chunk" | "translation_unit"
+        ) {
+            break;
+        }
+        current = parent;
+    }
+
+    // 优先级3：普通单行 → 返回光标所在完整行
+    let row = range.start.row;
+    let start = Point::new(row, 0);
+    let end = Point::new(row, buffer.line_len(row));
+    start..end
+}
+
+
 fn runnable_ranges(
     buffer: &BufferSnapshot,
     range: Range<Point>,
@@ -660,7 +736,6 @@ fn runnable_ranges(
             // if !jupytext_snippets.is_empty() {
             //     return (jupytext_snippets, next_cursor);
             // }
-
             // If no cells, check if selected
             let is_empty_selection = range.start == range.end;
             //if no select
@@ -685,11 +760,12 @@ fn runnable_ranges(
         //TODO: should be smart to detect a single line with line breaks, and if place in
         // a for/if/def statement, should be smart enough to run the current smallest block
         ReplRunMode::Line => {
-            // let start_offset = range.start.to_offset(buffer);
-            // let layer = buffer.syntax_layer_at(start_offset)?;
-            // let root_node = layer.node();
-            // let mut cursor = root_node.walk();
-            snippet_range = cell_range(buffer, range.start.row, range.end.row);
+            let has_selection = range.start != range.end;
+            if has_selection {
+                snippet_range = cell_range(buffer, range.start.row, range.end.row);
+            } else {
+                snippet_range = line_runnable_range(buffer, range.clone())
+            }
         }
 
         //Run the current cell, 
