@@ -1571,3 +1571,135 @@ mod tests {
         assert_eq!(text, "    def bar(self):\n        pass");
     }    
 }
+
+#[gpui::test]
+fn test_line_runnable_range(cx: &mut App) {
+    let python = languages::language("python", tree_sitter_python::LANGUAGE.into());
+
+    // 场景1：简单单行语句 —— 应返回整行
+    let buffer = cx.new(|cx| {
+        let mut buffer = Buffer::local("print('hello')\n", cx);
+        buffer.set_language(Some(python.clone()), cx);
+        buffer
+    });
+    let snapshot = buffer.read(cx).snapshot();
+    let range = super::line_runnable_range(&snapshot, Point::new(0, 0)..Point::new(0, 0));
+    let text: String = snapshot.text_for_range(range).collect();
+    assert_eq!(text, "print('hello')");
+
+    // 场景2：函数定义 —— 光标在块头行应返回整个函数体，在内部行返回单行
+    let code = "def f():\n    print('inside')\n    print('also inside')\nprint('outside')\n";
+    let buffer = cx.new(|cx| {
+        let mut buffer = Buffer::local(code, cx);
+        buffer.set_language(Some(python.clone()), cx);
+        buffer
+    });
+    let snapshot = buffer.read(cx).snapshot();
+
+    // 光标在 def 行
+    let range = super::line_runnable_range(&snapshot, Point::new(0, 0)..Point::new(0, 0));
+    let text: String = snapshot.text_for_range(range).collect();
+    assert_eq!(text, "def f():\n    print('inside')\n    print('also inside')");
+
+    // 光标在函数体内第一行
+    let range = super::line_runnable_range(&snapshot, Point::new(1, 0)..Point::new(1, 0));
+    let text: String = snapshot.text_for_range(range).collect();
+    assert_eq!(text, "    print('inside')");
+
+    // 光标在函数体内第二行
+    let range = super::line_runnable_range(&snapshot, Point::new(2, 0)..Point::new(2, 0));
+    let text: String = snapshot.text_for_range(range).collect();
+    assert_eq!(text, "    print('also inside')");
+
+    // 光标在函数外
+    let range = super::line_runnable_range(&snapshot, Point::new(3, 0)..Point::new(3, 0));
+    let text: String = snapshot.text_for_range(range).collect();
+    assert_eq!(text, "print('outside')");
+
+    // 场景3：嵌套块（for → if → for）
+    // 代码结构：
+    // 0: for i in range(4):
+    // 1:     print('a')
+    // 2:     if i%2==0:
+    // 3:         for j in range(3):
+    // 4:             print("i and j")
+    // 5:         print("end")
+    let code = "for i in range(4):\n    print('a')\n    if i%2==0:\n        for j in range(3):\n            print('i and j')\n        print('end')\n";
+    let buffer = cx.new(|cx| {
+        let mut buffer = Buffer::local(code, cx);
+        buffer.set_language(Some(python.clone()), cx);
+        buffer
+    });
+    let snapshot = buffer.read(cx).snapshot();
+
+    // 光标在外层 for 块头（第0行）—— 应返回整个外层 for 块（第0‑5行）
+    let range = super::line_runnable_range(&snapshot, Point::new(0, 0)..Point::new(0, 0));
+    let text: String = snapshot.text_for_range(range).collect();
+    assert_eq!(text, "for i in range(4):\n    print('a')\n    if i%2==0:\n        for j in range(3):\n            print('i and j')\n        print('end')");
+
+    // 光标在外层 for 体内但不在内层块头（第1行）
+    let range = super::line_runnable_range(&snapshot, Point::new(1, 0)..Point::new(1, 0));
+    let text: String = snapshot.text_for_range(range).collect();
+    assert_eq!(text, "    print('a')");
+
+    // 光标在 if 块头（第2行）—— 应返回整个 if 块（第2‑5行）
+    let range = super::line_runnable_range(&snapshot, Point::new(2, 0)..Point::new(2, 0));
+    let text: String = snapshot.text_for_range(range).collect();
+    assert_eq!(
+        text,
+        "    if i%2==0:\n        for j in range(3):\n            print('i and j')\n        print('end')"
+    );
+
+    // 光标在内层 for 块头（第3行）—— 应返回内层 for 块（第3‑4行）
+    let range = super::line_runnable_range(&snapshot, Point::new(3, 0)..Point::new(3, 0));
+    let text: String = snapshot.text_for_range(range).collect();
+    assert_eq!(text, "        for j in range(3):\n            print('i and j')");
+
+    // 光标在内层 for 体内（第4行）—— 应只返回该行
+    let range = super::line_runnable_range(&snapshot, Point::new(4, 0)..Point::new(4, 0));
+    let text: String = snapshot.text_for_range(range).collect();
+    assert_eq!(text, "            print('i and j')");
+
+    // 光标在 if 体内但不在 for 头（第5行）—— 应只返回该行
+    let range = super::line_runnable_range(&snapshot, Point::new(5, 0)..Point::new(5, 0));
+    let text: String = snapshot.text_for_range(range).collect();
+    assert_eq!(text, "        print('end')");
+
+    // 场景4：跨行表达式（多行函数调用）
+    let code = "print(\n    'hello',\n    'world'\n)\n";
+    let buffer = cx.new(|cx| {
+        let mut buffer = Buffer::local(code, cx);
+        buffer.set_language(Some(python.clone()), cx);
+        buffer
+    });
+    let snapshot = buffer.read(cx).snapshot();
+
+    // 光标在跨行表达式的头行（第0行）—— 应返回整个调用
+    let range = super::line_runnable_range(&snapshot, Point::new(0, 0)..Point::new(0, 0));
+    let text: String = snapshot.text_for_range(range).collect();
+    assert_eq!(text, "print(\n    'hello',\n    'world'\n)");
+
+    // 光标在跨行表达式的中间行（第1行）—— 按设计仍返回整个调用
+    let range = super::line_runnable_range(&snapshot, Point::new(1, 0)..Point::new(1, 0));
+    let text: String = snapshot.text_for_range(range).collect();
+    assert_eq!(text, "print(\n    'hello',\n    'world'\n)");
+
+    // 场景5：else 块
+    let code = "if True:\n    print('if')\nelse:\n    print('else')\n";
+    let buffer = cx.new(|cx| {
+        let mut buffer = Buffer::local(code, cx);
+        buffer.set_language(Some(python.clone()), cx);
+        buffer
+    });
+    let snapshot = buffer.read(cx).snapshot();
+
+    // 光标在 if 行
+    let range = super::line_runnable_range(&snapshot, Point::new(0, 0)..Point::new(0, 0));
+    let text: String = snapshot.text_for_range(range).collect();
+    assert_eq!(text, "if True:\n    print('if')");
+
+    // 光标在 else 行
+    let range = super::line_runnable_range(&snapshot, Point::new(2, 0)..Point::new(2, 0));
+    let text: String = snapshot.text_for_range(range).collect();
+    assert_eq!(text, "else:\n    print('else')");
+}
