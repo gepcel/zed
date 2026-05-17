@@ -1703,5 +1703,3 @@ mod tests {
         assert_eq!(text, "else:\n    print('else')");
     }
 }
-
-
