@@ -686,8 +686,10 @@ fn line_runnable_range(buffer: &BufferSnapshot, range: Range<Point>) -> Range<Po
             return start..end;
         }
 
-        // 优先级2：最内层块语句 → 立即返回
-        if BLOCK_NODES.contains(&kind) {
+        // 优先级2：最内层块语句，但仅当光标位于块头所在行时才返回整个块
+        if BLOCK_NODES.contains(&kind)
+            && current.start_position().row as u32== range.start.row
+        {
             let start = buffer.offset_to_point(current.start_byte());
             let end = buffer.offset_to_point(current.end_byte());
             return start..end;
@@ -752,12 +754,12 @@ fn runnable_ranges(
                     }
                 }
             }
-            // there's selection, return selection
+            // if selection, return selection
             snippet_range = cell_range(buffer, range.start.row, range.end.row);
         }
 
         // Run a single line
-        //TODO: should be smart to detect a single line with line breaks, and if place in
+        //Auto detect a single line with line breaks, and if place in
         // a for/if/def statement, should be smart enough to run the current smallest block
         ReplRunMode::Line => {
             let has_selection = range.start != range.end;
