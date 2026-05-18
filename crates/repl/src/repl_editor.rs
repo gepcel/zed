@@ -321,50 +321,6 @@ pub fn run(
     anyhow::Ok(())
 }
 
-/// Find the enclosing top-level block at the cursor position using treesitter.
-/// Returns the range of the block, or the selection if non-empty.
-/// From [#49636](https://github.com/zed-industries/zed/pull/49636/changes#diff-4e8a38f6ee486b3ceb9c7a866f565ae73a80e22d9f070bb3d9a6c3b92db4ca31)
-fn block_range(buffer: &BufferSnapshot, selection: Range<Point>) -> Option<Range<Point>> {
-    let start_offset = selection.start.to_offset(buffer);
-    let end_offset = selection.end.to_offset(buffer);
-
-    // If user has non-empty selection, use it
-    if start_offset != end_offset {
-        return Some(selection);
-    }
-
-    // Get syntax layer at cursor position
-    let layer = buffer.syntax_layer_at(start_offset)?;
-    let root_node = layer.node();
-    let mut cursor = root_node.walk();
-
-    // Descend to the deepest node containing the cursor position
-    while cursor.goto_first_child_for_byte(start_offset).is_some() {}
-
-    // Walk up until we find a node whose parent is the root
-    loop {
-        let node = cursor.node();
-        if let Some(parent) = node.parent() {
-            let parent_kind = parent.kind();
-            // Common root node kinds across languages:
-            // Python: module, JavaScript/TypeScript: program, Rust/Go: source_file, Lua: chunk
-            if matches!(
-                parent_kind,
-                "module" | "program" | "source_file" | "chunk" | "translation_unit"
-            ) {
-                let start = buffer.offset_to_point(node.start_byte());
-                let end = buffer.offset_to_point(node.end_byte());
-                return Some(start..end);
-            }
-        }
-        if !cursor.goto_parent() {
-            break;
-        }
-    }
-    None
-}
-
-
 pub enum SessionSupport {
     ActiveSession(Entity<Session>),
     Inactive(KernelSpecification),
@@ -594,7 +550,7 @@ fn jupytext_cells(
         .map(|comment_prefix| format!("{comment_prefix}%%"))
         .collect::<Vec<_>>();
 
-    let mut snippet_start_row = None;
+    let snippet_start_row;
     loop {
         if jupytext_prefixes
             .iter()
@@ -605,6 +561,7 @@ fn jupytext_cells(
         } else if current_row > 0 {
             current_row -= 1;
         } else {
+            snippet_start_row = Some(0);
             break;
         }
     }
@@ -638,64 +595,194 @@ fn jupytext_cells(
     (snippets, None)
 }
 
+/// Find the enclosing top-level block at the cursor position using treesitter.
+/// Returns the range of the block, or the selection if non-empty.
+/// From [#49636](https://github.com/zed-industries/zed/pull/49636/changes#diff-4e8a38f6ee486b3ceb9c7a866f565ae73a80e22d9f070bb3d9a6c3b92db4ca31)
+fn block_range(buffer: &BufferSnapshot, selection: Range<Point>) -> Option<Range<Point>> {
+    let start_offset = selection.start.to_offset(buffer);
+    let end_offset = selection.end.to_offset(buffer);
 
-/// 找到当前行的【最小完整语法单元】
+    // If user has non-empty selection, use it
+    if start_offset != end_offset {
+        return Some(selection);
+    }
+
+    // Get syntax layer at cursor position
+    let layer = buffer.syntax_layer_at(start_offset)?;
+    let root_node = layer.node();
+    let mut cursor = root_node.walk();
+
+    // Descend to the deepest node containing the cursor position
+    while cursor.goto_first_child_for_byte(start_offset).is_some() {}
+
+    // Walk up until we find a node whose parent is the root
+    loop {
+        let node = cursor.node();
+        if let Some(parent) = node.parent() {
+            let parent_kind = parent.kind();
+            // Common root node kinds across languages:
+            // Python: module, JavaScript/TypeScript: program, Rust/Go: source_file, Lua: chunk
+            if matches!(
+                parent_kind,
+                "module" | "program" | "source_file" | "chunk" | "translation_unit"
+            ) {
+                let start = buffer.offset_to_point(node.start_byte());
+                let end = buffer.offset_to_point(node.end_byte());
+                return Some(start..end);
+            }
+        }
+        if !cursor.goto_parent() {
+            break;
+        }
+    }
+    None
+}
+
+// 辅助：判断行是否为空或注释行
+fn is_blank_or_comment(buffer: &BufferSnapshot, row: u32) -> bool {
+    if buffer.is_line_blank(row) {
+        return true;
+    }
+    let line_range = Point::new(row, 0)..Point::new(row, buffer.line_len(row));
+    let line_text: String = buffer.text_for_range(line_range).collect();
+    line_text.trim().starts_with('#')
+}
+
+// 辅助：从子句节点向上查找所属父块（if/for/while/try/match）
+fn find_parent_block(node: language::Node) -> Option<language::Node> {
+    let mut parent = node.parent()?;
+    loop {
+        let kind = parent.kind();
+        if matches!(
+            kind,
+            "if_statement" | "for_statement" | "while_statement" | "try_statement" | "match_statement"
+        ) {
+            return Some(parent);
+        }
+        parent = parent.parent()?;
+    }
+}
+
+// 辅助：从语法节点构造从行首开始的范围（保留前导空格/缩进）
+fn node_range_from_line_start(node: language::Node, buffer: &BufferSnapshot) -> Range<Point> {
+    let start_row = node.start_position().row as u32;
+    let start = Point::new(start_row, 0);
+    let end = buffer.offset_to_point(node.end_byte());
+    start..end
+}
+
+/// 找到当前行的【最小完整语法单元】（保留行首缩进）
 /// 规则：
-/// 1. 跨行表达式（如跨多行的函数调用）→ 返回整个跨行范围
-/// 2. 块语句（if/for/def/while）→ 返回整个块
-/// 3. 普通行 → 返回单行
+/// 1. 普通单行语句 → 返回当前行
+/// 2. 跨行表达式 → 返回整个表达式
+/// 3. 块语句（if/for/while/with/try/match 等）：
+///    - 光标在块头行 → 返回整个块
+///    - 光标在 elif/else/except/finally/case 行 → 返回包含它的最外层块
+/// 4. 空行或注释行 → 跳转到下一个可执行行，并对其应用上述规则
 fn line_runnable_range(buffer: &BufferSnapshot, range: Range<Point>) -> Range<Point> {
+    let row = range.start.row;
     let offset = range.start.to_offset(buffer);
+
+    // 规则4：空行或注释行 → 跳转到下一个可执行行，并重新应用本函数
+    if is_blank_or_comment(buffer, row) {
+        let max_row = buffer.max_point().row;
+        let mut next_row = row + 1;
+        while next_row <= max_row && is_blank_or_comment(buffer, next_row) {
+            next_row += 1;
+        }
+        if next_row <= max_row {
+            return line_runnable_range(buffer, Point::new(next_row, 0)..Point::new(next_row, 0));
+        } else {
+            return Point::new(row, 0)..Point::new(row, 0);
+        }
+    }
+
     let layer = match buffer.syntax_layer_at(offset) {
         Some(layer) => layer,
-        None => return range,
+        None => return Point::new(row, 0)..Point::new(row, buffer.line_len(row)),
     };
     let root = layer.node();
     let mut cursor = root.walk();
 
-    // 下沉到光标所在的最深节点
     while cursor.goto_first_child_for_byte(offset).is_some() {}
     let mut current = cursor.node();
 
-    const EXPRESSION_NODES: &[&str] = &[
-        "argument_list",
-        "call",
-        "parameters",
-        "expression_list",
-        "assignment",
+    const SUB_CLAUSES: &[&str] = &[
+        "else_clause",
+        "elif_clause",
+        "except_clause",
+        "finally_clause",
+        "case_clause",
     ];
 
     const BLOCK_NODES: &[&str] = &[
-        "function_definition",
         "for_statement",
-        "if_statement",
-        "else_clause",
         "while_statement",
-        "class_definition",
+        "with_statement",
+        "try_statement",
+        "match_statement",
+        "async_for_statement",
+        "async_with_statement",
     ];
+
+    let mut expr_candidate: Option<language::Node> = None;
 
     loop {
         let kind = current.kind();
 
-        // 优先级1：跨行表达式 → 立即返回
-        if EXPRESSION_NODES.contains(&kind)
-            && current.start_position().row != current.end_position().row
-        {
-            let start = buffer.offset_to_point(current.start_byte());
-            let end = buffer.offset_to_point(current.end_byte());
-            return start..end;
+        // 遇到 block 节点停止向上，避免进入外层函数/类
+        if kind == "block" {
+            break;
         }
 
-        // 优先级2：最内层块语句，但仅当光标位于块头所在行时才返回整个块
-        if BLOCK_NODES.contains(&kind)
-            && current.start_position().row as u32== range.start.row
-        {
-            let start = buffer.offset_to_point(current.start_byte());
-            let end = buffer.offset_to_point(current.end_byte());
-            return start..end;
+        // if 语句：扩展到最外层 if
+        if kind == "if_statement" && current.start_position().row as u32 == row {
+            let mut outer = current;
+            while let Some(parent) = outer.parent() {
+                if parent.kind() == "if_statement" {
+                    outer = parent;
+                } else {
+                    break;
+                }
+            }
+            return node_range_from_line_start(outer, buffer);
         }
 
-        // 向上一层，遇根节点则停止
+        // 函数/类定义：若光标在函数头（def 到冒号之间的任意行），返回整个块
+        if matches!(
+            kind,
+            "function_definition" | "class_definition" | "async_function_definition"
+        ) {
+            let is_in_header = current
+                .child_by_field_name("body")
+                .map_or(true, |body| (row as usize) < body.start_position().row);
+            if is_in_header {
+                return node_range_from_line_start(current, buffer);
+            }
+        }
+
+        // 特殊子句：返回所属父块
+        if SUB_CLAUSES.contains(&kind) && current.start_position().row as u32 == row {
+            if let Some(parent_block) = find_parent_block(current) {
+                return node_range_from_line_start(parent_block, buffer);
+            }
+        }
+
+        // 独立块语句（光标在头行）
+        if BLOCK_NODES.contains(&kind) && current.start_position().row as u32 == row {
+            return node_range_from_line_start(current, buffer);
+        }
+
+        // 记录跨行表达式候选（排除块/子句/if）
+        if kind != "block"
+            && !BLOCK_NODES.contains(&kind)
+            && !SUB_CLAUSES.contains(&kind)
+            && kind != "if_statement"
+            && (current.start_position().row as u32) != (current.end_position().row as u32)
+        {
+            expr_candidate = Some(current);
+        }
+
         let Some(parent) = current.parent() else {
             break;
         };
@@ -708,13 +795,13 @@ fn line_runnable_range(buffer: &BufferSnapshot, range: Range<Point>) -> Range<Po
         current = parent;
     }
 
-    // 优先级3：普通单行 → 返回光标所在完整行
-    let row = range.start.row;
-    let start = Point::new(row, 0);
-    let end = Point::new(row, buffer.line_len(row));
-    start..end
-}
+    if let Some(expr) = expr_candidate {
+        return node_range_from_line_start(expr, buffer);
+    }
 
+    // 普通单行：返回整行
+    Point::new(row, 0)..Point::new(row, buffer.line_len(row))
+}
 
 fn runnable_ranges(
     buffer: &BufferSnapshot,
@@ -1575,55 +1662,53 @@ mod tests {
     fn test_line_runnable_range(cx: &mut App) {
         let python = languages::language("python", tree_sitter_python::LANGUAGE.into());
 
-        // 场景1：简单单行语句 —— 应返回整行
-        let buffer = cx.new(|cx| {
-            let mut buffer = Buffer::local("print('hello')\n", cx);
-            buffer.set_language(Some(python.clone()), cx);
-            buffer
-        });
-        let snapshot = buffer.read(cx).snapshot();
-        let range = line_runnable_range(&snapshot, Point::new(0, 0)..Point::new(0, 0));
-        let text: String = snapshot.text_for_range(range).collect();
-        assert_eq!(text, "print('hello')");
+        // 复杂测试代码，覆盖所有场景
+        let code = indoc::indoc! {r#"
+            # This is a comment
+            print("First line")
 
-        // 场景2：函数定义 —— 光标在块头行应返回整个函数体，在内部行返回单行
-        let code = "def f():\n    print('inside')\n    print('also inside')\nprint('outside')\n";
-        let buffer = cx.new(|cx| {
-            let mut buffer = Buffer::local(code, cx);
-            buffer.set_language(Some(python.clone()), cx);
-            buffer
-        });
-        let snapshot = buffer.read(cx).snapshot();
+            def func(long_arg_a, long_arc_b,
+                long_arc_c):
+                print("First line of func")
+                for i in range(4):
+                    if(i%3==0):
+                        print("Inside if")
+                    elif(i%3==1):
+                        print("Inside elif")
+                    else:
+                        with open("f.txt") as f:
+                            f.readline()
+                        print("Inside else")
+                    print("Inside for outside if..else")
+                    try:
+                        x = 1 / (i - 2)
+                    except ZeroDivisionError:
+                        print("Division by zero")
+                    except Exception as e:
+                        print("Other error")
+                    finally:
+                        print("Finally block")
+                match status:
+                    case 200:
+                        print("OK")
+                    case 404:
+                        print("Not Found")
+                    case _:
+                        print("Unknown")
+                print(
+                    "multi-line",
+                    "call",
+                )
 
-        // 光标在 def 行
-        let range = line_runnable_range(&snapshot, Point::new(0, 0)..Point::new(0, 0));
-        let text: String = snapshot.text_for_range(range).collect();
-        assert_eq!(text, "def f():\n    print('inside')\n    print('also inside')");
+            async def async_func():
+                async for j in async_range(3):
+                    print(j)
+                async with async_open("f.txt") as f:
+                    await f.read()
 
-        // 光标在函数体内第一行
-        let range = line_runnable_range(&snapshot, Point::new(1, 0)..Point::new(1, 0));
-        let text: String = snapshot.text_for_range(range).collect();
-        assert_eq!(text, "    print('inside')");
+            print("Last line")
+        "#};
 
-        // 光标在函数体内第二行
-        let range = line_runnable_range(&snapshot, Point::new(2, 0)..Point::new(2, 0));
-        let text: String = snapshot.text_for_range(range).collect();
-        assert_eq!(text, "    print('also inside')");
-
-        // 光标在函数外
-        let range = line_runnable_range(&snapshot, Point::new(3, 0)..Point::new(3, 0));
-        let text: String = snapshot.text_for_range(range).collect();
-        assert_eq!(text, "print('outside')");
-
-        // 场景3：嵌套块（for → if → for）
-        // 代码结构：
-        // 0: for i in range(4):
-        // 1:     print('a')
-        // 2:     if i%2==0:
-        // 3:         for j in range(3):
-        // 4:             print("i and j")
-        // 5:         print("end")
-        let code = "for i in range(4):\n    print('a')\n    if i%2==0:\n        for j in range(3):\n            print('i and j')\n        print('end')\n";
         let buffer = cx.new(|cx| {
             let mut buffer = Buffer::local(code, cx);
             buffer.set_language(Some(python.clone()), cx);
@@ -1631,75 +1716,129 @@ mod tests {
         });
         let snapshot = buffer.read(cx).snapshot();
 
-        // 光标在外层 for 块头（第0行）—— 应返回整个外层 for 块（第0‑5行）
-        let range = line_runnable_range(&snapshot, Point::new(0, 0)..Point::new(0, 0));
-        let text: String = snapshot.text_for_range(range).collect();
-        assert_eq!(text, "for i in range(4):\n    print('a')\n    if i%2==0:\n        for j in range(3):\n            print('i and j')\n        print('end')");
+        // 辅助闭包：获取指定行的运行文本
+        let run_line = |row: u32| -> String {
+            let range = line_runnable_range(&snapshot, Point::new(row, 0)..Point::new(row, 0));
+            snapshot.text_for_range(range).collect()
+        };
 
-        // 光标在外层 for 体内但不在内层块头（第1行）
-        let range = line_runnable_range(&snapshot, Point::new(1, 0)..Point::new(1, 0));
-        let text: String = snapshot.text_for_range(range).collect();
-        assert_eq!(text, "    print('a')");
+        // ---- 规则4：注释行或空行 ----
+        assert_eq!(run_line(0), r#"print("First line")"#);
 
-        // 光标在 if 块头（第2行）—— 应返回整个 if 块（第2‑5行）
-        let range = line_runnable_range(&snapshot, Point::new(2, 0)..Point::new(2, 0));
-        let text: String = snapshot.text_for_range(range).collect();
+        // 空行（行2）、行3、行4都应该跳转到 def 并返回整个函数定义        
         assert_eq!(
-            text,
-            "    if i%2==0:\n        for j in range(3):\n            print('i and j')\n        print('end')"
+            run_line(2),
+            "def func(long_arg_a, long_arc_b,\n    long_arc_c):\n    print(\"First line of func\")\n    for i in range(4):\n        if(i%3==0):\n            print(\"Inside if\")\n        elif(i%3==1):\n            print(\"Inside elif\")\n        else:\n            with open(\"f.txt\") as f:\n                f.readline()\n            print(\"Inside else\")\n        print(\"Inside for outside if..else\")\n        try:\n            x = 1 / (i - 2)\n        except ZeroDivisionError:\n            print(\"Division by zero\")\n        except Exception as e:\n            print(\"Other error\")\n        finally:\n            print(\"Finally block\")\n    match status:\n        case 200:\n            print(\"OK\")\n        case 404:\n            print(\"Not Found\")\n        case _:\n            print(\"Unknown\")\n    print(\n        \"multi-line\",\n        \"call\",\n    )"
+        );
+        assert!(run_line(2)==run_line(3) && run_line(2)==run_line(4));
+
+        // ---- 普通单行 ----
+        assert_eq!(run_line(1), r#"print("First line")"#);
+
+        // ---- 跨行表达式（多行 print 调用）----
+        assert_eq!(
+            run_line(31),
+            "    print(\n        \"multi-line\",\n        \"call\",\n    )"
+        );
+        assert_eq!(
+            run_line(32),
+            "    print(\n        \"multi-line\",\n        \"call\",\n    )"
+        );
+        assert_eq!(
+            run_line(33),
+            "    print(\n        \"multi-line\",\n        \"call\",\n    )"
+        );
+        assert_eq!(
+            run_line(34),
+            "    print(\n        \"multi-line\",\n        \"call\",\n    )"
         );
 
-        // 光标在内层 for 块头（第3行）—— 应返回内层 for 块（第3‑4行）
-        let range = line_runnable_range(&snapshot, Point::new(3, 0)..Point::new(3, 0));
-        let text: String = snapshot.text_for_range(range).collect();
-        assert_eq!(text, "        for j in range(3):\n            print('i and j')");
+        // ---- 函数定义块 ----
+        assert_eq!(
+            run_line(3),
+            "def func(long_arg_a, long_arc_b,\n    long_arc_c):\n    print(\"First line of func\")\n    for i in range(4):\n        if(i%3==0):\n            print(\"Inside if\")\n        elif(i%3==1):\n            print(\"Inside elif\")\n        else:\n            with open(\"f.txt\") as f:\n                f.readline()\n            print(\"Inside else\")\n        print(\"Inside for outside if..else\")\n        try:\n            x = 1 / (i - 2)\n        except ZeroDivisionError:\n            print(\"Division by zero\")\n        except Exception as e:\n            print(\"Other error\")\n        finally:\n            print(\"Finally block\")\n    match status:\n        case 200:\n            print(\"OK\")\n        case 404:\n            print(\"Not Found\")\n        case _:\n            print(\"Unknown\")\n    print(\n        \"multi-line\",\n        \"call\",\n    )"
+        );
 
-        // 光标在内层 for 体内（第4行）—— 应只返回该行
-        let range = line_runnable_range(&snapshot, Point::new(4, 0)..Point::new(4, 0));
-        let text: String = snapshot.text_for_range(range).collect();
-        assert_eq!(text, "            print('i and j')");
+        // ---- for 块 ----
+        assert_eq!(
+            run_line(6),
+            "    for i in range(4):\n        if(i%3==0):\n            print(\"Inside if\")\n        elif(i%3==1):\n            print(\"Inside elif\")\n        else:\n            with open(\"f.txt\") as f:\n                f.readline()\n            print(\"Inside else\")\n        print(\"Inside for outside if..else\")\n        try:\n            x = 1 / (i - 2)\n        except ZeroDivisionError:\n            print(\"Division by zero\")\n        except Exception as e:\n            print(\"Other error\")\n        finally:\n            print(\"Finally block\")"
+        );
 
-        // 光标在 if 体内但不在 for 头（第5行）—— 应只返回该行
-        let range = line_runnable_range(&snapshot, Point::new(5, 0)..Point::new(5, 0));
-        let text: String = snapshot.text_for_range(range).collect();
-        assert_eq!(text, "        print('end')");
+        // ---- if/elif/else 完整块 ----
+        assert_eq!(
+            run_line(7),
+            "        if(i%3==0):\n            print(\"Inside if\")\n        elif(i%3==1):\n            print(\"Inside elif\")\n        else:\n            with open(\"f.txt\") as f:\n                f.readline()\n            print(\"Inside else\")"
+        );
+        assert_eq!(run_line(9), run_line(7)); // elif 行应与 if 行返回相同
+        assert_eq!(run_line(11), run_line(7)); // else 行应与 if 行返回相同
 
-        // 场景4：跨行表达式（多行函数调用）
-        let code = "print(\n    'hello',\n    'world'\n)\n";
-        let buffer = cx.new(|cx| {
-            let mut buffer = Buffer::local(code, cx);
+        // ---- with 块 ----
+        assert_eq!(
+            run_line(12),
+            "            with open(\"f.txt\") as f:\n                f.readline()"
+        );
+
+        // ---- try/except/finally 完整块 ----
+        assert_eq!(
+            run_line(16),
+            "        try:\n            x = 1 / (i - 2)\n        except ZeroDivisionError:\n            print(\"Division by zero\")\n        except Exception as e:\n            print(\"Other error\")\n        finally:\n            print(\"Finally block\")"
+        );
+        assert_eq!(run_line(18), run_line(16)); // except 行
+        assert_eq!(run_line(22), run_line(16)); // finally 行
+
+        // ---- match/case 完整块 ----
+        assert_eq!(
+            run_line(24),
+            "    match status:\n        case 200:\n            print(\"OK\")\n        case 404:\n            print(\"Not Found\")\n        case _:\n            print(\"Unknown\")"
+        );
+        assert_eq!(run_line(25), run_line(24)); // case 行
+
+        // ---- async 函数定义 ----
+        assert_eq!(
+            run_line(36),
+            "async def async_func():\n    async for j in async_range(3):\n        print(j)\n    async with async_open(\"f.txt\") as f:\n        await f.read()"
+        );
+
+        // async for
+        assert_eq!(
+            run_line(37),
+            "    async for j in async_range(3):\n        print(j)"
+        );
+
+        // async with
+        assert_eq!(
+            run_line(39),
+            "    async with async_open(\"f.txt\") as f:\n        await f.read()"
+        );
+
+        // ---- 最后单行 ----
+        assert_eq!(run_line(42), r#"print("Last line")"#);
+
+        // ---- 多行括号表达式 ----
+        let paren_code = indoc::indoc! {r#"
+            (
+            df.fillna(0)
+                .head()
+            )
+        "#};
+        let buffer2 = cx.new(|cx| {
+            let mut buffer = Buffer::local(paren_code, cx);
             buffer.set_language(Some(python.clone()), cx);
             buffer
         });
-        let snapshot = buffer.read(cx).snapshot();
-
-        // 光标在跨行表达式的头行（第0行）—— 应返回整个调用
-        let range = line_runnable_range(&snapshot, Point::new(0, 0)..Point::new(0, 0));
-        let text: String = snapshot.text_for_range(range).collect();
-        assert_eq!(text, "print(\n    'hello',\n    'world'\n)");
-
-        // 光标在跨行表达式的中间行（第1行）—— 按设计仍返回整个调用
-        let range = line_runnable_range(&snapshot, Point::new(1, 0)..Point::new(1, 0));
-        let text: String = snapshot.text_for_range(range).collect();
-        assert_eq!(text, "print(\n    'hello',\n    'world'\n)");
-
-        // 场景5：else 块
-        let code = "if True:\n    print('if')\nelse:\n    print('else')\n";
-        let buffer = cx.new(|cx| {
-            let mut buffer = Buffer::local(code, cx);
-            buffer.set_language(Some(python.clone()), cx);
-            buffer
-        });
-        let snapshot = buffer.read(cx).snapshot();
-
-        // 光标在 if 行
-        let range = line_runnable_range(&snapshot, Point::new(0, 0)..Point::new(0, 0));
-        let text: String = snapshot.text_for_range(range).collect();
-        assert_eq!(text, "if True:\n    print('if')");
-
-        // 光标在 else 行
-        let range = line_runnable_range(&snapshot, Point::new(2, 0)..Point::new(2, 0));
-        let text: String = snapshot.text_for_range(range).collect();
-        assert_eq!(text, "else:\n    print('else')");
+        let snapshot2 = buffer2.read(cx).snapshot();
+        let run_line2 = |row: u32| -> String {
+            let range = line_runnable_range(&snapshot2, Point::new(row, 0)..Point::new(row, 0));
+            snapshot2.text_for_range(range).collect()
+        };
+        assert_eq!(
+            run_line2(0),
+            "(\ndf.fillna(0)\n    .head()\n)"
+        );
+        assert_eq!(
+            run_line2(3),
+            "(\ndf.fillna(0)\n    .head()\n)"
+        );
     }
 }
