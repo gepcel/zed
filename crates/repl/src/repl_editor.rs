@@ -680,8 +680,21 @@ fn node_range_from_line_start(node: language::Node, buffer: &BufferSnapshot) -> 
 ///    - 光标在 elif/else/except/finally/case 行 → 返回包含它的最外层块
 /// 4. 空行或注释行 → 跳转到下一个可执行行，并对其应用上述规则
 fn line_runnable_range(buffer: &BufferSnapshot, range: Range<Point>) -> Range<Point> {
+
     let row = range.start.row;
-    let offset = range.start.to_offset(buffer);
+    let line_len = buffer.line_len(row);
+
+    // 将列限制在当前行有效范围内，防止 offset 落入下一行
+    let col = if line_len == 0 {
+        0
+    } else {
+        range.start.column.min(line_len - 1)
+    };
+    let offset = Point::new(row, col).to_offset(buffer);
+
+    // The following two lines sometimes cause the offset to move to the next line when the cursor is at the end of the line, which causes the block detection to fail. So we need to ensure the offset is always within the current line.
+    // let row = range.start.row;
+    // let offset = range.start.to_offset(buffer);
 
     // 规则4：空行或注释行 → 跳转到下一个可执行行，并重新应用本函数
     if is_blank_or_comment(buffer, row) {
